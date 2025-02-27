@@ -3,10 +3,11 @@ import pandas as pd
 import requests
 import os
 import time
-from datetime import datetime
 import json
+from datetime import datetime
 import base64
 from io import StringIO
+import concurrent.futures
 
 class UltraMsgWhatsAppMessenger:
     def __init__(self, instance_id=None, api_token=None):
@@ -125,6 +126,73 @@ class UltraMsgWhatsAppMessenger:
             raise Exception(f"API Error {response.status_code}: {response.text}")
         
         return response.json()
+    
+    def send_broadcast(self, to_numbers, message):
+        """
+        Send a broadcast message to multiple recipients using UltraMsg API
+        
+        :param to_numbers: List of recipient phone numbers
+        :param message: Message content to broadcast
+        :return: API response
+        """
+        if not self.base_url or not self.api_token:
+            raise ValueError("UltraMsg credentials not configured")
+            
+        url = f"{self.base_url}/messages/chat"
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        
+        # Format all phone numbers
+        formatted_numbers = [self._format_phone(phone) for phone in to_numbers]
+        
+        responses = []
+        
+        # UltraMsg processes multiple recipients by sending individual messages
+        # This implementation sends them in parallel which is more efficient
+        
+        def send_single_message(formatted_phone):
+            payload = {
+                'token': self.api_token,
+                'to': formatted_phone,
+                'body': message
+            }
+            
+            response = requests.post(url, headers=headers, data=payload)
+            
+            if response.status_code != 200:
+                return {
+                    'phone': formatted_phone,
+                    'success': False,
+                    'error': f"API Error {response.status_code}: {response.text}"
+                }
+            else:
+                return {
+                    'phone': formatted_phone,
+                    'success': True,
+                    'response': response.json()
+                }
+        
+        # Use ThreadPoolExecutor to send messages in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all tasks
+            future_to_phone = {
+                executor.submit(send_single_message, phone): phone 
+                for phone in formatted_numbers
+            }
+            
+            # Get results as they complete
+            for future in concurrent.futures.as_completed(future_to_phone):
+                phone = future_to_phone[future]
+                try:
+                    response = future.result()
+                    responses.append(response)
+                except Exception as e:
+                    responses.append({
+                        'phone': phone,
+                        'success': False,
+                        'error': str(e)
+                    })
+        
+        return responses
 
 def clean_phone_numbers(df):
     """
@@ -150,8 +218,8 @@ def clean_phone_numbers(df):
     
     return df
 
-def apply_filters(df, address=None, min_spent=None, after_date=None):
-    """Apply filters to the DataFrame"""
+def apply_filters(df, address=None, min_spent=None, after_date=None, limit=None):
+    """Apply filters to the DataFrame with an optional limit on number of customers"""
     filtered_df = df.copy()
     
     if address:
@@ -162,6 +230,10 @@ def apply_filters(df, address=None, min_spent=None, after_date=None):
     
     if after_date:
         filtered_df = filtered_df[pd.to_datetime(filtered_df['last_purchase']) >= pd.to_datetime(after_date)]
+    
+    # Apply limit if specified
+    if limit and limit > 0 and limit < len(filtered_df):
+        filtered_df = filtered_df.head(limit)
     
     return filtered_df
 
@@ -195,7 +267,7 @@ def main():
         
         # API credentials
         with st.expander("UltraMsg API Credentials", expanded=True):
-            instance_id = st.text_input("Instance ID", value=st.session_state.get('instance_id', ''), type="password")
+            instance_id = st.text_input("Instance ID", value=st.session_state.get('instance_id', ''), type="default")
             api_token = st.text_input("API Token", value=st.session_state.get('api_token', ''), type="password")
             
             if instance_id:
@@ -277,19 +349,41 @@ def main():
                         purchase_after = None
                         st.info("'last_purchase' column not found in data")
                 
+                # Add limit option
+                limit_customers = st.number_input(
+                    "Limit to first N customers (0 = no limit):", 
+                    min_value=0, 
+                    max_value=len(st.session_state['df']),
+                    value=0,
+                    help="Set a limit to only select the first N customers after applying filters"
+                )
+                
                 submit_button = st.form_submit_button(label="Apply Filters")
             
             if submit_button:
-                # Apply filters
+                # Apply filters with optional limit
                 filtered_df = apply_filters(
                     st.session_state['df'],
                     address=address_filter if address_filter else None,
                     min_spent=min_spent if min_spent > 0 else None,
-                    after_date=purchase_after if purchase_after else None
+                    after_date=purchase_after if purchase_after else None,
+                    limit=limit_customers if limit_customers > 0 else None
                 )
                 
                 st.session_state['filtered_df'] = filtered_df
-                st.success(f"Filtered to {len(filtered_df)} customers")
+                
+                # Show how many were filtered
+                total_matching = len(apply_filters(
+                    st.session_state['df'],
+                    address=address_filter if address_filter else None,
+                    min_spent=min_spent if min_spent > 0 else None,
+                    after_date=purchase_after if purchase_after else None
+                ))
+                
+                if limit_customers > 0 and limit_customers < total_matching:
+                    st.success(f"Filtered to {len(filtered_df)} customers (limited from {total_matching} total matches)")
+                else:
+                    st.success(f"Filtered to {len(filtered_df)} customers")
     
     with col2:
         if 'filtered_df' in st.session_state and len(st.session_state['filtered_df']) > 0:
@@ -297,6 +391,9 @@ def main():
             
             # Display selected customers
             st.dataframe(st.session_state['filtered_df'])
+            
+            # Display count
+            st.write(f"**{len(st.session_state['filtered_df'])} customers selected**")
             
             # Debug view for selected customers
             if st.session_state['debug_mode']:
@@ -316,7 +413,8 @@ def main():
                 live_mode = st.toggle("🔴 Live Mode", value=st.session_state['live_mode'])
                 st.session_state['live_mode'] = live_mode
             
-            message_tab, image_tab = st.tabs(["Text Message", "Image Message"])
+            # Tabs for different message types
+            message_tab, image_tab, broadcast_tab = st.tabs(["Text Message", "Image Message", "Broadcast"])
             
             with message_tab:
                 text_message = st.text_area(
@@ -333,7 +431,7 @@ def main():
                 
                 if st.button("Send Text Messages", key="send_text", disabled=not (instance_id and api_token)):
                     if not (instance_id and api_token):
-                        st.error("Please configure UltraMsg API credentials in the sidebar")
+                        st.error("Please configure your UltraMsg API credentials")
                     else:
                         messenger = UltraMsgWhatsAppMessenger(instance_id, api_token)
                         
@@ -431,7 +529,7 @@ def main():
                     if not image_url:
                         st.error("Please enter an image URL")
                     elif not (instance_id and api_token):
-                        st.error("Please configure UltraMsg API credentials in the sidebar")
+                        st.error("Please configure your UltraMsg API credentials")
                     else:
                         messenger = UltraMsgWhatsAppMessenger(instance_id, api_token)
                         
@@ -508,6 +606,118 @@ def main():
                                             st.json(st.session_state['last_api_response'])
                                 
                             st.success(f"Completed! Sent {sent_count} images with {error_count} errors.")
+
+            with broadcast_tab:
+                st.subheader("Send the same message to all selected customers")
+                
+                broadcast_message = st.text_area(
+                    "Enter your broadcast message:",
+                    "Hello {name}! We have a special offer for all our customers!",
+                    help="You can use {name} to personalize for each recipient"
+                )
+                
+                # Add a way to limit the batch size to avoid rate limits
+                col_batch1, col_batch2 = st.columns([1, 1])
+                with col_batch1:
+                    batch_size = st.number_input("Batch size (recipients per batch):", min_value=1, max_value=100, value=20)
+                with col_batch2:
+                    delay_between_batches = st.number_input("Seconds between batches:", min_value=1, max_value=60, value=5)
+                
+                test_mode = not st.session_state['live_mode']
+                if test_mode:
+                    st.info("TEST MODE ACTIVE - Broadcast will not actually be sent")
+                else:
+                    st.warning("LIVE MODE ACTIVE - Broadcast will be sent to ALL selected recipients!")
+                
+                if st.button("Send Broadcast", key="send_broadcast", disabled=not (instance_id and api_token)):
+                    if not (instance_id and api_token):
+                        st.error("Please configure your UltraMsg API credentials")
+                    else:
+                        messenger = UltraMsgWhatsAppMessenger(instance_id, api_token)
+                        
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        total_recipients = len(st.session_state['filtered_df'])
+                        recipients = st.session_state['filtered_df']
+                        
+                        # Display summary before proceeding
+                        st.write(f"Preparing to broadcast to {total_recipients} recipients")
+                        
+                        # Split into batches to avoid rate limits
+                        batches = []
+                        for i in range(0, total_recipients, batch_size):
+                            batches.append(recipients.iloc[i:i+batch_size])
+                        
+                        st.write(f"Split into {len(batches)} batches of up to {batch_size} recipients each")
+                        
+                        if test_mode:
+                            # Just simulate the broadcast
+                            for batch_idx, batch in enumerate(batches):
+                                status_text.write(f"Processing batch {batch_idx+1} of {len(batches)}")
+                                
+                                # Show recipients in this batch
+                                st.write(f"**Batch {batch_idx+1}** would include:")
+                                for _, row in batch.iterrows():
+                                    name = row.get('name', 'Customer')
+                                    phone = row.get('phone', '')
+                                    personalized_message = broadcast_message.replace('{name}', name)
+                                    st.text(f"- {name} ({phone})")
+                                
+                                # Update progress
+                                progress_bar.progress((batch_idx + 1) / len(batches))
+                                
+                                # Simulate delay between batches (shorter for demo)
+                                if batch_idx < len(batches) - 1:
+                                    status_text.write(f"Would wait {delay_between_batches} seconds before next batch...")
+                                    time.sleep(1)  # Shorter wait for test mode
+                            
+                            st.success("Test completed! No messages were actually sent.")
+                        else:
+                            # Actually send the broadcast
+                            sent_count = 0
+                            error_count = 0
+                            
+                            for batch_idx, batch in enumerate(batches):
+                                status_text.write(f"Sending batch {batch_idx+1} of {len(batches)}")
+                                
+                                # For each recipient, we need to personalize the message
+                                for _, row in batch.iterrows():
+                                    try:
+                                        name = row.get('name', 'Customer')
+                                        phone = row.get('phone', '')
+                                        
+                                        if not phone:
+                                            status_text.write(f"⚠️ Missing phone number for {name}, skipping...")
+                                            error_count += 1
+                                            continue
+                                            
+                                        # Personalize message for this recipient
+                                        personalized_message = broadcast_message.replace('{name}', name)
+                                        
+                                        # Send individual message (since we're personalizing)
+                                        result = messenger.send_message(phone, personalized_message)
+                                        
+                                        sent_count += 1
+                                        
+                                        # Debug info
+                                        if st.session_state['debug_mode']:
+                                            st.text(f"✓ Sent to {name} ({phone})")
+                                        
+                                    except Exception as e:
+                                        error_count += 1
+                                        if st.session_state['debug_mode']:
+                                            st.error(f"Error sending to {row.get('name', '')}: {str(e)}")
+                                
+                                # Update progress
+                                progress_bar.progress((batch_idx + 1) / len(batches))
+                                
+                                # Wait before next batch to avoid rate limits
+                                if batch_idx < len(batches) - 1:
+                                    status_text.write(f"Waiting {delay_between_batches} seconds before next batch...")
+                                    time.sleep(delay_between_batches)
+                            
+                            st.success(f"Broadcast completed!Sent to {sent_count} recipients with {error_count} errors.")
         
         elif 'df' in st.session_state:
             st.info("Apply filters to select customers for messaging")
